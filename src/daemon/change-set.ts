@@ -61,9 +61,6 @@ export class ChangeSet {
   }
 
   merge(other: ChangeSetSnapshot): void {
-    if (this.forceFullReconcile && this.size > 0) {
-      return;
-    }
     for (const path of other.touchedFiles) this.touchedFiles.add(path);
     for (const path of other.rescanDirectories)
       this.rescanDirectories.add(path);

@@ -99,3 +99,28 @@ test("change set retains a path after an explicit full reconciliation request", 
     forceFullReconcile: true,
   });
 });
+
+test("change set merge preserves failed flush paths during reconciliation", () => {
+  const root = join(tmpdir(), "change-set-merge-recovery");
+  const changes = new ChangeSet();
+  changes.requireFullReconcile();
+  changes.add(join(root, "during-reconcile.ts"), "changed");
+
+  changes.merge({
+    touchedFiles: [join(root, "failed-a.ts"), join(root, "failed-b.ts")],
+    rescanDirectories: [join(root, "failed-dir")],
+    deletedPrefixes: [join(root, "removed.ts")],
+    forceFullReconcile: true,
+  });
+
+  assert.deepEqual(changes.snapshot(), {
+    touchedFiles: [
+      join(root, "during-reconcile.ts"),
+      join(root, "failed-a.ts"),
+      join(root, "failed-b.ts"),
+    ].sort(),
+    rescanDirectories: [join(root, "failed-dir")],
+    deletedPrefixes: [join(root, "removed.ts")],
+    forceFullReconcile: true,
+  });
+});
