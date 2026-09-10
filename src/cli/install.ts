@@ -58,6 +58,10 @@ type InstallAgentOptions = {
 
 type InstallAgentResult = {
   files: string[];
+  /** Primary agent configuration file to show in the install summary. */
+  configPath?: string;
+  /** Optional explanation when config-file discovery requires a choice. */
+  configNote?: string;
 };
 
 const AGENT_INSTALLERS: readonly AgentInstaller[] = [
@@ -146,7 +150,7 @@ export async function runInstall(parsed: ParsedArgs): Promise<void> {
 
   console.log("\nInstalling integrations\n");
   for (const installer of installers) {
-    await installer.install({
+    const result = await installer.install({
       force: parsed.options.force === true,
       transport,
       mcpToolset: parsed.options.mcpToolset,
@@ -157,6 +161,12 @@ export async function runInstall(parsed: ParsedArgs): Promise<void> {
     });
     console.log(`  ${installSuccessMark()} ${installer.label}`);
     console.log("    MCP       configured");
+    if (result.configPath) {
+      console.log(`    Config    ${result.configPath}`);
+    }
+    if (result.configNote) {
+      console.log(`    Note      ${result.configNote}`);
+    }
     console.log("");
   }
 
@@ -298,11 +308,14 @@ async function uninstallCodexIntegration(): Promise<InstallAgentResult> {
 async function installOpenCodeIntegration(
   options: InstallAgentOptions,
 ): Promise<InstallAgentResult> {
-  const configPath = resolveOpenCodeConfigPath();
+  const resolvedConfig = await resolveOpenCodeConfigPath();
+  const configPath = resolvedConfig.path;
   const guidancePath = resolve(dirname(configPath), "AGENTS.md");
-  await installJsonMcpServer({
+  await updateJsoncMcpSettings({
     path: configPath,
     containerKey: "mcp",
+    // OpenCode accepts JSONC trailing commas, so its installer must accept them too.
+    allowTrailingComma: true,
     server:
       options.transport === "stdio"
         ? {
@@ -327,6 +340,7 @@ async function installOpenCodeIntegration(
           },
     force: options.force,
     label: "OpenCode",
+    isManaged: isManagedJsonMcpServer,
   });
   await writeMarkedFile({
     path: guidancePath,
@@ -338,13 +352,29 @@ async function installOpenCodeIntegration(
     }),
     force: true,
   });
-  return { files: [configPath, guidancePath] };
+  return {
+    files: [configPath, guidancePath],
+    configPath,
+    configNote: resolvedConfig.note,
+  };
 }
 
 async function uninstallOpenCodeIntegration(): Promise<InstallAgentResult> {
-  const configPath = resolveOpenCodeConfigPath();
+  const resolvedConfig = await resolveOpenCodeConfigPath();
+  const configPath = resolvedConfig.path;
   const guidancePath = resolve(dirname(configPath), "AGENTS.md");
-  await uninstallJsonMcpServer(configPath, "mcp");
+  // OpenCode deep-merges both global files, so legacy managed entries in the
+  // non-selected file must also be removed. An explicit OPENCODE_CONFIG remains scoped.
+  for (const path of resolvedConfig.managedCleanupPaths ?? [configPath]) {
+    await removeJsoncMcpSettings(
+      path,
+      "OpenCode",
+      isManagedJsonMcpServer,
+      "mcp",
+      // Keep uninstall compatible with every configuration accepted by OpenCode.
+      true,
+    );
+  }
   await removeMarkedFile({
     path: guidancePath,
     startMarker: ZVEC_GREP_AGENTS_START,
@@ -845,11 +875,38 @@ function resolveClaudeMcpConfigPath(): string {
     : resolve(homedir(), ".claude.json");
 }
 
-function resolveOpenCodeConfigPath(): string {
-  return resolve(
-    process.env.OPENCODE_CONFIG ??
-      resolve(homedir(), ".config", "opencode", "opencode.json"),
+async function resolveOpenCodeConfigPath(): Promise<{
+  path: string;
+  note?: string;
+  managedCleanupPaths?: readonly string[];
+}> {
+  const configured = process.env.OPENCODE_CONFIG?.trim();
+  if (configured) return { path: resolve(configured) };
+
+  const configDirectory = resolve(
+    process.env.XDG_CONFIG_HOME?.trim() || resolve(homedir(), ".config"),
+    "opencode",
   );
+  const jsoncPath = resolve(configDirectory, "opencode.jsonc");
+  const jsonPath = resolve(configDirectory, "opencode.json");
+  const [jsoncExists, jsonExists] = await Promise.all([
+    pathExists(jsoncPath),
+    pathExists(jsonPath),
+  ]);
+
+  if (jsoncExists) {
+    return {
+      path: jsoncPath,
+      managedCleanupPaths: [jsoncPath, jsonPath],
+      note: jsonExists
+        ? "both opencode.jsonc and opencode.json exist; selected opencode.jsonc"
+        : undefined,
+    };
+  }
+  return {
+    path: jsonPath,
+    managedCleanupPaths: [jsoncPath, jsonPath],
+  };
 }
 
 function resolveCursorConfigPath(): string {
@@ -1569,6 +1626,8 @@ function qoderIdeMcpServer(
 
 type JsoncMcpSettingsOptions = {
   path: string;
+  containerKey?: "mcp" | "mcpServers";
+  allowTrailingComma?: boolean;
   force: boolean;
   label: string;
   server: Record<string, unknown>;
@@ -1600,13 +1659,17 @@ async function assertQoderMcpSettingsReplaceable(
 async function updateJsoncMcpSettings(
   options: JsoncMcpSettingsOptions,
 ): Promise<JsonObject> {
+  const containerKey = options.containerKey ?? "mcpServers";
   const existing = await readTextFileIfExists(options.path);
   let source = existing.trim() ? existing : "{}\n";
-  const root = parseJsoncSettings(options.path, source, options.label);
-  validateMcpSettingsContainer(options.path, root);
+  const root = parseJsoncSettings(options.path, source, options.label, {
+    allowTrailingComma: options.allowTrailingComma,
+  });
+  validateJsoncMcpContainer(options.path, root, containerKey);
 
-  const mcpServers = isJsonObject(root.mcpServers) ? root.mcpServers : {};
-  const current = mcpServers.zvec_grep;
+  const currentContainer = root[containerKey];
+  const container = isJsonObject(currentContainer) ? currentContainer : {};
+  const current = container.zvec_grep;
   if (current !== undefined && !options.isManaged(current) && !options.force) {
     throw new Error(
       `Existing unmanaged zvec_grep MCP server found in ${options.path}. Re-run with --force to replace it for ${options.label}.`,
@@ -1615,7 +1678,7 @@ async function updateJsoncMcpSettings(
 
   source = editJsonWithComments(
     source,
-    ["mcpServers", "zvec_grep"],
+    [containerKey, "zvec_grep"],
     options.server,
   );
   await writeTextFileAtomic(options.path, ensureTrailingNewline(source));
@@ -1626,26 +1689,31 @@ async function removeJsoncMcpSettings(
   path: string,
   label: string,
   isManaged: (value: unknown) => boolean,
+  containerKey: "mcp" | "mcpServers" = "mcpServers",
+  allowTrailingComma = false,
 ): Promise<void> {
   const existing = await readTextFileIfExists(path);
   if (!existing.trim()) return;
 
   let source = existing;
-  const root = parseJsoncSettings(path, source, label);
-  validateMcpSettingsContainer(path, root);
-  const mcpServers = isJsonObject(root.mcpServers) ? root.mcpServers : {};
+  const root = parseJsoncSettings(path, source, label, {
+    allowTrailingComma,
+  });
+  validateJsoncMcpContainer(path, root, containerKey);
+  const currentContainer = root[containerKey];
+  const container = isJsonObject(currentContainer) ? currentContainer : {};
 
-  if (isManaged(mcpServers.zvec_grep)) {
+  if (isManaged(container.zvec_grep)) {
     source = hasJsoncComments(source)
       ? removeJsoncPropertyPreservingComments(source, [
-          "mcpServers",
+          containerKey,
           "zvec_grep",
         ])
       : editJsonWithComments(
           source,
-          Object.keys(mcpServers).length === 1
-            ? ["mcpServers"]
-            : ["mcpServers", "zvec_grep"],
+          Object.keys(container).length === 1
+            ? [containerKey]
+            : [containerKey, "zvec_grep"],
           undefined,
         );
   }
@@ -1654,14 +1722,25 @@ async function removeJsoncMcpSettings(
   }
 }
 
+function validateJsoncMcpContainer(
+  path: string,
+  root: JsonObject,
+  containerKey: "mcp" | "mcpServers",
+): void {
+  if (root[containerKey] !== undefined && !isJsonObject(root[containerKey])) {
+    throw new Error(`Invalid ${containerKey} configuration in ${path}.`);
+  }
+}
+
 function parseJsoncSettings(
   path: string,
   source: string,
   label: string,
+  options: { allowTrailingComma?: boolean } = {},
 ): JsonObject {
   const errors: ParseError[] = [];
   const parsed = parseJsonWithComments(source, errors, {
-    allowTrailingComma: false,
+    allowTrailingComma: options.allowTrailingComma ?? false,
     disallowComments: false,
   });
   if (errors.length > 0 || !isJsonObject(parsed)) {
@@ -2065,6 +2144,15 @@ async function fileModeIfExists(path: string): Promise<number | undefined> {
       return undefined;
     }
     throw error;
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path, fileSystemConstants.F_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
